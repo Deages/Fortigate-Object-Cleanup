@@ -16,6 +16,7 @@ except ImportError:
 
 LOG_FILE = "script_log.txt"
 OUTPUT_CSV = "inactive_addresses.csv"
+WHITELIST_FILE = "whitelist.txt"
 
 # Target ranges to evaluate for inactivity (RFC 1918 + Specific Public Range)
 TARGET_RANGES = [
@@ -35,11 +36,11 @@ logging.basicConfig(
 )
 
 def find_files():
-    """Locate the FortiGate config, active networks, and summary ranges whitelist."""
+    """Locate the FortiGate config, active networks, and whitelist file."""
     # Look for configs. If a user saved it as .txt, try to catch it if 'fw' or 'conf' is in the name.
     conf_files = glob.glob('*.conf') + [f for f in glob.glob('*.txt') if 'fw' in f.lower() or 'conf' in f.lower()]
     
-    # Look for data lists (Routing and Whitelist)
+    # Look for data lists
     data_files = glob.glob('*.csv') + glob.glob('*.xlsx') + glob.glob('*.txt')
     
     # Remove script outputs from being parsed as inputs
@@ -62,12 +63,17 @@ def find_files():
     selected_routing = None
     selected_whitelist = None
     
-    # Distinguish between the active networks and the summary whitelist by filename
-    for f in data_files:
-        if 'summary' in f.lower():
+    # Identify the whitelist file exactly by name
+    # We do a case-insensitive check just to be safe
+    for f in data_files.copy():
+        if f.lower() == WHITELIST_FILE:
             selected_whitelist = f
-        elif not selected_routing:
-            selected_routing = f
+            data_files.remove(f) # Remove so it isn't picked up as the routing file
+            break
+
+    # Any remaining .csv, .xlsx, or .txt file is assumed to be the active networks file
+    if data_files:
+        selected_routing = data_files[0]
 
     if not selected_routing:
         logging.error("No active networks .csv, .xlsx, or .txt file found.")
@@ -79,7 +85,7 @@ def find_files():
     if selected_whitelist:
         logging.info(f"Selected Whitelist File: {selected_whitelist}")
     else:
-        logging.warning("No summary ranges file found. Whitelist logic will be bypassed.")
+        logging.warning(f"No {WHITELIST_FILE} found. Whitelist logic will be bypassed.")
     
     return selected_conf, selected_routing, selected_whitelist
 
@@ -92,6 +98,7 @@ def load_networks_from_file(filepath, label="Networks"):
     logging.info(f"--- Loading {label} ---")
     
     try:
+        # Pandas handles structured files, standard open handles flat text
         if filepath.endswith('.xlsx'):
             df = pd.read_excel(filepath)
             raw_values = df.values.flatten().astype(str).tolist()
@@ -107,11 +114,13 @@ def load_networks_from_file(filepath, label="Networks"):
             if not val or val.lower() == 'nan':
                 continue
             try:
+                # Convert string to IPv4Network. strict=False allows valid processing 
+                # even if host bits are set in a subnet string.
                 network = ipaddress.ip_network(val, strict=False)
                 networks.append(network)
                 logging.debug(f"Loaded {label.lower()}: {network}")
             except ValueError:
-                pass # Skip headers or invalid strings silently
+                pass # Skip headers, descriptions, or invalid strings silently
                 
         logging.info(f"Successfully loaded {len(networks)} {label.lower()}.")
         return networks
@@ -121,40 +130,47 @@ def load_networks_from_file(filepath, label="Networks"):
         exit(1)
 
 def parse_fortigate_objects(conf_filepath):
-    """Parse the FortiGate config file to extract firewall address objects."""
+    """Parse the FortiGate config file to extract firewall address objects across all VDOMs."""
     fw_objects = []
     logging.info("--- Parsing FortiGate Configuration ---")
     
     in_firewall_address_section = False
     current_obj_name = None
     
+    # Matches: edit "ObjectName"
     edit_regex = re.compile(r'^\s*edit\s+"?([^"\n]+)"?')
+    # Matches: set subnet 192.168.1.0 255.255.255.0
     subnet_regex = re.compile(r'^\s*set\s+subnet\s+([\d\.]+)\s+([\d\.]+)')
 
     with open(conf_filepath, 'r', encoding='utf-8', errors='ignore') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             
+            # Enter address section parsing mode
             if line == "config firewall address":
                 in_firewall_address_section = True
                 continue
             
+            # Exit address section parsing mode (safely continues reading file for other VDOMs)
             if in_firewall_address_section and line == "end":
                 in_firewall_address_section = False
                 continue
                 
             if in_firewall_address_section:
+                # Attempt to extract object name
                 edit_match = edit_regex.match(line)
                 if edit_match:
                     current_obj_name = edit_match.group(1)
                     continue
                 
+                # If we have an object name in memory, look for its subnet details
                 if current_obj_name:
                     subnet_match = subnet_regex.match(line)
                     if subnet_match:
                         ip = subnet_match.group(1)
                         mask = subnet_match.group(2)
                         try:
+                            # Translate FortiOS syntax into CIDR
                             network = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
                             fw_objects.append({
                                 'name': current_obj_name,
@@ -164,13 +180,14 @@ def parse_fortigate_objects(conf_filepath):
                         except ValueError as e:
                             logging.warning(f"Line {line_num}: Invalid subnet for object '{current_obj_name}' - {e}")
                         
+                        # Flush current object so subsequent set commands aren't falsely mapped
                         current_obj_name = None
 
     logging.info(f"Successfully parsed {len(fw_objects)} subnet address objects from the firewall.")
     return fw_objects
 
 def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
-    """Compare firewall objects against parameters to find unused ones."""
+    """Evaluate FW objects against scope constraints, whitelists, and active routing tables."""
     inactive_objects = []
     logging.info("--- Beginning Comparison ---")
     
@@ -178,7 +195,7 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
         obj_name = obj['name']
         obj_network = obj['network']
         
-        # 1. Filter Check: Is this network in our target scope? (RFC 1918 + 129.78.0.0/16)
+        # 1. Scope Constraint Check (RFC 1918 + Specific Public Ranges)
         in_target_scope = False
         for target in TARGET_RANGES:
             try:
@@ -192,15 +209,16 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             logging.debug(f"SKIPPED: FW Object '{obj_name}' ({obj_network}) is outside targeted check ranges.")
             continue
             
-        # 2. Whitelist Check: Is this network explicitly whitelisted?
+        # 2. Whitelist Exclusion Check (Summary VRF Ranges, etc.)
         if obj_network in whitelist_networks:
             logging.debug(f"WHITELISTED: FW Object '{obj_name}' ({obj_network}) matches a summary range.")
             continue
 
-        # 3. Routing Check: Is this network part of the active routing table?
+        # 3. Active Routing Check (Is it a subset of a known active path?)
         is_active = False
         for active_net in active_networks:
             try:
+                # subnet_of validates if the object resides inside the active network
                 if obj_network.subnet_of(active_net):
                     logging.debug(f"VALID: FW Object '{obj_name}' ({obj_network}) is active within routed network ({active_net})")
                     is_active = True
@@ -208,6 +226,7 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             except TypeError:
                 continue
                 
+        # If it passes constraints but fails the active routing check, flag for deletion
         if not is_active:
             logging.warning(f"INACTIVE: FW Object '{obj_name}' ({obj_network}) is NOT found in active routing networks.")
             inactive_objects.append({
@@ -218,12 +237,12 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
     return inactive_objects
 
 def export_inactive_to_csv(inactive_objects):
-    """Write the inactive objects to a CSV file dynamically based on naming structure."""
+    """De-duplicate, sort, format, and write the inactive objects to a final CSV."""
     if not inactive_objects:
         logging.info(f"Great news! No inactive objects found. Skipping creation of {OUTPUT_CSV}.")
         return
 
-    # Deduplicate the objects before exporting
+    # Deduplication (Handles objects duplicated across multiple VDOMs/VRFs)
     unique_inactive = []
     seen = set()
     for obj in inactive_objects:
@@ -234,7 +253,7 @@ def export_inactive_to_csv(inactive_objects):
             
     inactive_objects = unique_inactive
 
-    # Sort the list of dictionaries numerically by the IP address subnet
+    # Sort numerically by IP subnet
     inactive_objects.sort(key=lambda x: ipaddress.ip_network(x['subnet'], strict=False))
 
     logging.info(f"--- Exporting {len(inactive_objects)} unique inactive objects to {OUTPUT_CSV} ---")
@@ -248,11 +267,13 @@ def export_inactive_to_csv(inactive_objects):
                 net_obj = ipaddress.ip_network(subnet_str, strict=False)
                 base_ip_str = str(net_obj.network_address)
                 
-                # Regex boundary check to ensure the IP matches exactly and is not just a 
-                # substring of a different IP (e.g., finding "10.1.1.1" but avoiding "10.1.1.15")
+                # Intelligent string formatting logic
+                # Regex boundary check ensures we don't accidentally match 10.1.1.1 
+                # against a custom name like "Server_10.1.1.15"
                 ip_pattern = r'(?<!\d)' + re.escape(base_ip_str) + r'(?!\d)'
                 
-                # If the exact IP or the full subnet string is found anywhere within the object name
+                # If the exact IP or the full CIDR notation is found anywhere within the object name
+                # write a clean single-column line. Otherwise, retain the custom name alongside the IP.
                 if re.search(ip_pattern, name) or subnet_str in name:
                     writer.writerow([name])
                 else:
@@ -268,20 +289,20 @@ def export_inactive_to_csv(inactive_objects):
 if __name__ == "__main__":
     logging.info("Starting FortiGate Object Cleanup Check...")
     
-    # 1. Locate files automatically
+    # 1. Locate working files dynamically
     conf_file, routing_file, whitelist_file = find_files()
     
-    # 2. Extract networks from both files
+    # 2. Extract networks into actionable data structures
     active_nets = load_networks_from_file(routing_file, "Active Networks")
     whitelist_nets = load_networks_from_file(whitelist_file, "Summary Ranges")
     
-    # 3. Extract firewall objects
+    # 3. Extract FortiOS firewall objects
     fw_objs = parse_fortigate_objects(conf_file)
     
-    # 4. Compare datasets
+    # 4. Compare datasets based on specific logic
     inactive = compare_and_find_inactive(fw_objs, active_nets, whitelist_nets)
     
-    # 5. Output results
+    # 5. Output finalized intelligence
     export_inactive_to_csv(inactive)
     
     logging.info("Script execution finished.")
