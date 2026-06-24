@@ -195,7 +195,12 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
         obj_name = obj['name']
         obj_network = obj['network']
         
-        # 1. Scope Constraint Check (RFC 1918 + Specific Public Ranges)
+        # 1. Name-based Whitelist Check ("VRF Peer" or similar)
+        if 'vrf peer' in obj_name.lower():
+            logging.debug(f"WHITELISTED (NAME): FW Object '{obj_name}' ({obj_network}) contains 'VRF Peer'.")
+            continue
+
+        # 2. Scope Constraint Check (RFC 1918 + Specific Public Ranges)
         in_target_scope = False
         for target in TARGET_RANGES:
             try:
@@ -209,12 +214,12 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             logging.debug(f"SKIPPED: FW Object '{obj_name}' ({obj_network}) is outside targeted check ranges.")
             continue
             
-        # 2. Whitelist Exclusion Check (Summary VRF Ranges, etc.)
+        # 3. Whitelist Exclusion Check (Summary VRF Ranges, etc.)
         if obj_network in whitelist_networks:
             logging.debug(f"WHITELISTED: FW Object '{obj_name}' ({obj_network}) matches a summary range.")
             continue
 
-        # 3. Active Routing Check (Is it a subset of a known active path?)
+        # 4. Active Routing Check (Is it a subset of a known active path?)
         is_active = False
         for active_net in active_networks:
             try:
