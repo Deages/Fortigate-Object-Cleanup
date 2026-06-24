@@ -128,7 +128,6 @@ Containing CIDR ranges that should be excluded from cleanup analysis.
 ```text
 10.0.0.0/8
 172.16.0.0/12
-129.78.0.0/16
 ```
 
 ---
