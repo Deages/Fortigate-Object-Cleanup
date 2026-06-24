@@ -12,7 +12,7 @@ When migrating services or restructuring networks (especially in environments ut
 - Step 3: Make sure your fortigate config file is in the same directory.
 - Step 4: run python3 fw_cleanup_check.py and check inactive_addresses.csv for the output.
 - Step 5: run fmg_inactive_cleanup.py
-- Step 6: copy the contents of "fmg_script_output.txt" into your FortiManager Scripts section.
+- Step 6: copy the contents of "fmg_script_output.txt" into your FortiManager Scripts section and run it.
 
 
 ---
