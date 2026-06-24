@@ -11,6 +11,8 @@ When migrating services or restructuring networks (especially in environments ut
 - Step 2: Create a txt file, csv or xlsx file (e.g. networks.txt) that has all the active networks in your environment, line separated.
 - Step 3: Make sure your fortigate config file is in the same directory.
 - Step 4: run python3 fw_cleanup_check.py and check inactive_addresses.csv for the output.
+- Step 5: run fmg_inactive_cleanup.py
+- Step 6: copy the contents of "fmg_script_output.txt" into your FortiManager Scripts section.
 
 
 ---
@@ -48,6 +50,10 @@ h_10.1.1.5,10.1.1.5/32
 Generates a verbose `.txt` log file to provide an exact audit trail of why an object was marked valid or invalid for peer review.
 
 ---
+
+## Nuances:
+- It's hard coded to ignore 129.78.0.0/16 since that's our org IP range.
+- It's hard coded to ignore any object that has "VRF Peer" in the name for our use cases.
 
 ## Prerequisites
 
