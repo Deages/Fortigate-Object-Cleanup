@@ -4,6 +4,15 @@ A Python automation script designed for enterprise FortiGate environments to ide
 
 When migrating services or restructuring networks (especially in environments utilizing VRFs and multiple VDOMs), address objects are frequently left behind in the configuration. This script parses a FortiOS 7.4 configuration file, compares all configured address objects against a master list of active IP routing networks, and outputs a formatted, deduplicated CSV of objects that are safe to delete.
 
+
+## Quick start guide:
+
+- Step 1: Create a whitelist.txt file with each IP/object you want to whitelist from being marked as inactive.
+- Step 2: Create a txt file, csv or xlsx file (e.g. networks.txt) that has all the active networks in your environment, line separated.
+- Step 3: Make sure your fortigate config file is in the same directory.
+- Step 4: run python3 fw_cleanup_check.py and check inactive_addresses.csv for the output.
+
+
 ---
 
 ## Features
