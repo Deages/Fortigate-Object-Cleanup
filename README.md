@@ -161,6 +161,10 @@ A detailed debugging and audit log showing:
 
 This provides a complete audit trail for peer review and change-control processes.
 
+### `fmg_script_output.txt`
+
+A copy/paste block of text for your FortiManager so that you can import it into Device Manager -> Scripts -> run it.
+
 ---
 
 ## Use Case
