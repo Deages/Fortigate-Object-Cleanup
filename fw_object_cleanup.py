@@ -391,6 +391,7 @@ def parse_config_for_usage(conf_filepath, inactive_dict):
     Phase 2 Parser: 
     Scans the configuration to map VDOMs, Groups, and Policies.
     Checks if any objects in the 'inactive_dict' are actively utilized.
+    Uses a context stack to accurately trace FortiOS nesting depth.
     """
     groups_to_modify = defaultdict(lambda: defaultdict(set))
     all_group_members = defaultdict(lambda: defaultdict(set))
@@ -399,7 +400,7 @@ def parse_config_for_usage(conf_filepath, inactive_dict):
     logging.info("--- Parsing FortiGate Configuration for Object Usage (Phase 2) ---")
 
     current_vdom = "root"
-    current_config = None
+    context_stack = []
     current_edit = None
 
     with open(conf_filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -409,27 +410,38 @@ def parse_config_for_usage(conf_filepath, inactive_dict):
             if not stripped_line:
                 continue
 
-            # State Machine context tracking
-            if stripped_line.startswith("config vdom"):
-                pass 
-            elif stripped_line.startswith("config "):
-                current_config = stripped_line[7:].strip()
+            # State Machine context tracking (Stack-based)
+            if stripped_line.startswith("config "):
+                context = stripped_line[7:].strip()
+                context_stack.append(context)
+                if context == "global":
+                    current_vdom = "global"
+                    
+            elif stripped_line == "end":
+                if context_stack:
+                    context_stack.pop()
+                current_edit = None
+                
             elif stripped_line.startswith("edit "):
-                name = stripped_line[5:].strip().strip('"')
-                if current_config is None:
+                # Extracts the name (stripping quotes)
+                name = stripped_line[5:].strip().strip('"').strip("'")
+                
+                # If we are directly inside 'config vdom', this sets our VDOM environment
+                if context_stack and context_stack[-1] == "vdom":
                     current_vdom = name
                 else:
                     current_edit = name
+                    
             elif stripped_line == "next":
+                # Close the current edit block
                 current_edit = None
-                if current_config is None:
-                    current_vdom = "root" 
-            elif stripped_line == "end":
-                current_config = None
-
-            elif current_edit:
+                
+            # Content Extraction Logic
+            elif current_edit and context_stack:
+                current_context = context_stack[-1]
+                
                 # 1. Address Groups
-                if current_config == "firewall addrgrp" and stripped_line.startswith("set member "):
+                if current_context == "firewall addrgrp" and stripped_line.startswith("set member "):
                     try:
                         tokens = shlex.split(stripped_line)
                         members = tokens[2:]
@@ -442,7 +454,7 @@ def parse_config_for_usage(conf_filepath, inactive_dict):
                         logging.warning(f"Line {line_num}: Malformed group member syntax: {stripped_line}")
 
                 # 2. Firewall Policies
-                elif current_config == "firewall policy" and (stripped_line.startswith("set srcaddr ") or stripped_line.startswith("set dstaddr ")):
+                elif current_context == "firewall policy" and (stripped_line.startswith("set srcaddr ") or stripped_line.startswith("set dstaddr ")):
                     try:
                         tokens = shlex.split(stripped_line)
                         direction = tokens[1] 
