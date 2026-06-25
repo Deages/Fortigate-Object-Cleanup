@@ -255,17 +255,24 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
 
         # 2. FQDN DNS Validation logic
         if obj_type == 'fqdn':
+            # Clean the FQDN and strip wildcard syntax (*.domain.com -> domain.com) for valid DNS querying
+            fqdn_to_test = obj_val.strip().strip('"').strip("'")
+            if fqdn_to_test.startswith("*."):
+                fqdn_to_test = fqdn_to_test[2:]
+                
             try:
-                # gethostbyname_ex automatically follows CNAME aliases and fetches A records
-                socket.gethostbyname_ex(obj_val)
-                logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved to an A record or CNAME.")
-            except socket.gaierror:
-                logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) returned NXDOMAIN (Non-existent domain).")
+                # getaddrinfo is the most robust Python resolver. It handles CNAME chaining cleanly.
+                socket.getaddrinfo(fqdn_to_test, None)
+                logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved.")
+            except socket.gaierror as e:
+                logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) failed to resolve: {e}")
                 inactive_objects.append({
                     'name': obj_name,
                     'subnet': f"FQDN:{obj_val}",
                     'type': 'fqdn'
                 })
+            except Exception as e:
+                logging.error(f"ERROR (DNS): Failed to query FQDN '{obj_name}' ({obj_val}): {e}")
             continue
 
         # 3. Subnet logic starts here
@@ -315,7 +322,7 @@ def export_inactive_to_txt(inactive_objects):
     """De-duplicate, sort, format, and write the inactive objects to OUTPUT_INACTIVE."""
     if not inactive_objects:
         logging.info(f"Great news! No inactive objects found. Skipping creation of {OUTPUT_INACTIVE}.")
-        return set()
+        return {}
 
     # Deduplicate objects
     unique_inactive = []
@@ -338,7 +345,7 @@ def export_inactive_to_txt(inactive_objects):
 
     logging.info(f"--- Exporting {len(sorted_inactive)} unique inactive objects to {OUTPUT_INACTIVE} ---")
     
-    unique_names_only = set()
+    inactive_obj_dict = {}
     
     try:
         with open(OUTPUT_INACTIVE, mode='w', newline='', encoding='utf-8') as f:
@@ -347,7 +354,9 @@ def export_inactive_to_txt(inactive_objects):
             for obj in sorted_inactive:
                 name = obj['name']
                 subnet_str = obj['subnet']
-                unique_names_only.add(name)
+                
+                # Store the object's type for the policy report
+                inactive_obj_dict[name] = obj['type']
                 
                 if obj['type'] == 'fqdn':
                     fqdn_val = subnet_str.replace("FQDN:", "")
@@ -369,17 +378,17 @@ def export_inactive_to_txt(inactive_objects):
     except Exception as e:
         logging.error(f"Failed to write to text file: {e}")
         
-    return unique_names_only
+    return inactive_obj_dict
 
 # ==========================================
 # Phase 2: FMG Policy & Group Tracking
 # ==========================================
 
-def parse_config_for_usage(conf_filepath, inactive_names):
+def parse_config_for_usage(conf_filepath, inactive_dict):
     """
     Phase 2 Parser: 
     Scans the configuration to map VDOMs, Groups, and Policies.
-    Checks if any objects in the 'inactive_names' set are actively utilized.
+    Checks if any objects in the 'inactive_dict' are actively utilized.
     """
     groups_to_modify = defaultdict(lambda: defaultdict(set))
     all_group_members = defaultdict(lambda: defaultdict(set))
@@ -424,7 +433,7 @@ def parse_config_for_usage(conf_filepath, inactive_names):
                         members = tokens[2:]
                         for m in members:
                             all_group_members[current_vdom][current_edit].add(m)
-                            if m in inactive_names:
+                            if m in inactive_dict:
                                 groups_to_modify[current_vdom][current_edit].add(m)
                                 logging.info(f"[VDOM: {current_vdom}] Object '{m}' found in Address Group '{current_edit}'. Queued for unselect.")
                     except ValueError:
@@ -437,12 +446,13 @@ def parse_config_for_usage(conf_filepath, inactive_names):
                         direction = tokens[1] 
                         members = tokens[2:]
                         for m in members:
-                            if m in inactive_names:
+                            if m in inactive_dict:
                                 policy_usages.append({
                                     'vdom': current_vdom,
                                     'policy_id': current_edit,
                                     'direction': direction,
-                                    'object': m
+                                    'object': m,
+                                    'type': inactive_dict[m]  # Track whether it's FQDN or Subnet
                                 })
                                 logging.warning(f"[VDOM: {current_vdom}] Policy {current_edit} is actively using target object '{m}' as {direction}.")
                     except ValueError:
@@ -475,6 +485,10 @@ def generate_policy_report(policy_usages):
                 f.write(f"Policy ID:  {usage['policy_id']}\n")
                 f.write(f"Direction:  {usage['direction']}\n")
                 f.write(f"Object:     \"{usage['object']}\"\n")
+                
+                # Report if it is an FQDN or Subnet object
+                obj_type_str = "FQDN" if usage['type'] == 'fqdn' else "Subnet/Address"
+                f.write(f"Type:       {obj_type_str}\n")
                 f.write("-" * 40 + "\n")
                 
         logging.info(f"Policy report successfully written to {POLICY_REPORT}")
@@ -548,12 +562,12 @@ if __name__ == "__main__":
     # 4. [Phase 1] Evaluate objects for inactivity
     inactive_data = compare_and_find_inactive(fw_objs, active_nets, whitelist_nets)
     
-    # 5. [Phase 1] Output the initial evaluation and retain the set of unique names 
-    inactive_obj_names = export_inactive_to_txt(inactive_data)
+    # 5. [Phase 1] Output the initial evaluation and retain dictionary of names/types
+    inactive_obj_dict = export_inactive_to_txt(inactive_data)
     
-    if inactive_obj_names:
+    if inactive_obj_dict:
         # 6. [Phase 2] Parse the config again for Group and Policy usages
-        grps_to_modify, pol_usages, all_grp_members = parse_config_for_usage(conf_file, inactive_obj_names)
+        grps_to_modify, pol_usages, all_grp_members = parse_config_for_usage(conf_file, inactive_obj_dict)
         
         # 7. [Phase 2] Generate outputs for FMG UI handling
         generate_policy_report(pol_usages)
