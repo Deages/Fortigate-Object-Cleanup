@@ -239,7 +239,7 @@ def parse_fortigate_objects(conf_filepath):
     logging.info(f"Successfully parsed {len(fw_objects)} address objects from the firewall.")
     return fw_objects
 
-def check_redundant_subnets(fw_objects):
+def check_redundant_subnets(fw_objects, whitelist_networks):
     """Diagnoses and alerts on objects that are strict subsets of other objects."""
     logging.info("--- Performing Enhanced Subnet Overlap Detection ---")
     subnets = [o for o in fw_objects if o['type'] == 'subnet']
@@ -249,6 +249,15 @@ def check_redundant_subnets(fw_objects):
         for obj2 in subnets:
             if obj1['name'] == obj2['name']:
                 continue
+            
+            # Ignore overlap checks against large summary routes (/16, /8, etc.)
+            if obj2['value'].prefixlen <= 16:
+                continue
+                
+            # Ignore overlap checks against any explicitly whitelisted networks
+            if obj2['value'] in whitelist_networks:
+                continue
+
             # Alert if obj1 is completely encompassed by obj2 (but smaller)
             try:
                 if obj1['value'].subnet_of(obj2['value']) and obj1['value'].prefixlen > obj2['value'].prefixlen:
@@ -569,7 +578,7 @@ if __name__ == "__main__":
     fw_objs = parse_fortigate_objects(conf_file)
     
     # 4. [Phase 1] Diagnose subnet overlaps/redundancies
-    check_redundant_subnets(fw_objs)
+    check_redundant_subnets(fw_objs, whitelist_nets)
     
     # 5. [Phase 1] Evaluate objects for inactivity
     inactive_data = compare_and_find_inactive(fw_objs, active_nets, whitelist_nets)
