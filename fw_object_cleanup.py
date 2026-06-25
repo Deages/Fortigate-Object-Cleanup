@@ -215,8 +215,10 @@ def parse_fortigate_objects(conf_filepath):
                     
                     elif stripped_line.startswith("set fqdn "):
                         parts = shlex.split(stripped_line)
-                        if len(parts) >= 2:
-                            current_obj['value'] = parts[1]
+                        if len(parts) >= 3:
+                            # BUGFIX: shlex parses 'set fqdn "host.com"' into ['set', 'fqdn', 'host.com']
+                            # So parts[2] correctly targets the actual hostname string.
+                            current_obj['value'] = parts[2]
                             current_obj['type'] = 'fqdn'
                             
                     elif stripped_line.startswith("set subnet "):
