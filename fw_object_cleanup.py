@@ -4,8 +4,10 @@ FortiGate & FortiManager Address Object Cleanup Tool
 This script performs a comprehensive two-phase cleanup of FortiGate address objects:
 
 Phase 1: Analysis & Identification
-- Parses a FortiOS configuration file for all address objects.
-- Compares those objects against a master list of active routing networks.
+- Parses a FortiOS configuration file for all address objects (Subnets & FQDNs).
+- Validates FQDN objects against live DNS queries to ensure active A records.
+- Compares Subnet objects against a master list of active routing networks.
+- Flags and alerts on redundant subnet objects (e.g., overlapping subsets).
 - Bypasses objects based on scope (RFC 1918) and whitelist criteria.
 - Outputs unused objects to './outputs/inactive_objects.txt'.
 
@@ -13,6 +15,7 @@ Phase 2: FortiManager CLI Preparation
 - Scans the FortiOS configuration again to map VDOMs, Groups, and Policies.
 - Identifies if any of the inactive objects are actively referenced.
 - Generates FMG CLI syntax ('./outputs/fmg_script_config.txt') to safely unbind objects from groups.
+- Performs Recursive Group Analysis: Flags and deletes groups that become entirely empty.
 - Generates a manual cleanup report ('./outputs/policy_id_cleanup.txt') for objects stuck in policies.
 """
 
@@ -23,6 +26,7 @@ import logging
 import ipaddress
 import re
 import shlex
+import socket
 from collections import defaultdict
 
 try:
@@ -177,68 +181,120 @@ def load_networks_from_file(filepath, label="Networks"):
 # ==========================================
 
 def parse_fortigate_objects(conf_filepath):
-    """Phase 1 Parser: Extract all firewall address objects and their subnets."""
+    """Phase 1 Parser: Extract firewall address objects (Subnets and FQDNs)."""
     fw_objects = []
     logging.info("--- Parsing FortiGate Configuration (Phase 1) ---")
     
     in_firewall_address_section = False
-    current_obj_name = None
+    current_obj = None
     
     edit_regex = re.compile(r'^\s*edit\s+"?([^"\n]+)"?')
-    subnet_regex = re.compile(r'^\s*set\s+subnet\s+([\d\.]+)\s+([\d\.]+)')
 
     with open(conf_filepath, 'r', encoding='utf-8', errors='ignore') as f:
         for line_num, line in enumerate(f, 1):
-            line = line.strip()
+            stripped_line = line.strip()
             
-            if line == "config firewall address":
+            if stripped_line == "config firewall address":
                 in_firewall_address_section = True
                 continue
             
-            if in_firewall_address_section and line == "end":
+            if in_firewall_address_section and stripped_line == "end":
                 in_firewall_address_section = False
                 continue
                 
             if in_firewall_address_section:
-                edit_match = edit_regex.match(line)
+                edit_match = edit_regex.match(stripped_line)
                 if edit_match:
-                    current_obj_name = edit_match.group(1)
+                    if current_obj and current_obj.get('value') is not None:
+                        fw_objects.append(current_obj)
+                    current_obj = {'name': edit_match.group(1), 'type': 'unknown', 'value': None}
                     continue
                 
-                if current_obj_name:
-                    subnet_match = subnet_regex.match(line)
-                    if subnet_match:
-                        ip = subnet_match.group(1)
-                        mask = subnet_match.group(2)
-                        try:
-                            network = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
-                            fw_objects.append({
-                                'name': current_obj_name,
-                                'network': network
-                            })
-                        except ValueError as e:
-                            logging.warning(f"Line {line_num}: Invalid subnet for object '{current_obj_name}' - {e}")
-                        
-                        current_obj_name = None
+                if current_obj:
+                    if stripped_line.startswith("set type fqdn"):
+                        current_obj['type'] = 'fqdn'
+                    
+                    elif stripped_line.startswith("set fqdn "):
+                        parts = shlex.split(stripped_line)
+                        if len(parts) >= 2:
+                            current_obj['value'] = parts[1]
+                            current_obj['type'] = 'fqdn'
+                            
+                    elif stripped_line.startswith("set subnet "):
+                        parts = shlex.split(stripped_line)
+                        if len(parts) >= 3:
+                            ip = parts[2]
+                            mask = parts[3]
+                            try:
+                                current_obj['value'] = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+                                current_obj['type'] = 'subnet'
+                            except ValueError as e:
+                                logging.warning(f"Line {line_num}: Invalid subnet for object '{current_obj['name']}' - {e}")
+                                
+                    elif stripped_line == "next":
+                        if current_obj.get('value') is not None:
+                            fw_objects.append(current_obj)
+                        current_obj = None
 
-    logging.info(f"Successfully parsed {len(fw_objects)} subnet address objects from the firewall.")
+    logging.info(f"Successfully parsed {len(fw_objects)} address objects from the firewall.")
     return fw_objects
 
+def check_redundant_subnets(fw_objects):
+    """Diagnoses and alerts on objects that are strict subsets of other objects."""
+    logging.info("--- Performing Enhanced Subnet Overlap Detection ---")
+    subnets = [o for o in fw_objects if o['type'] == 'subnet']
+    redundancy_count = 0
+    
+    for obj1 in subnets:
+        for obj2 in subnets:
+            if obj1['name'] == obj2['name']:
+                continue
+            # Alert if obj1 is completely encompassed by obj2 (but smaller)
+            try:
+                if obj1['value'].subnet_of(obj2['value']) and obj1['value'].prefixlen > obj2['value'].prefixlen:
+                    logging.warning(f"REDUNDANCY ALERT: Object '{obj1['name']}' ({obj1['value']}) is a strict subset of '{obj2['name']}' ({obj2['value']}).")
+                    redundancy_count += 1
+            except TypeError:
+                pass
+
+    if redundancy_count == 0:
+        logging.info("No redundant subnet overlaps found.")
+    else:
+        logging.info(f"Subnet overlap check complete. Found {redundancy_count} potential redundancies.")
+
 def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
-    """Evaluate FW objects against scope constraints, whitelists, and active routing tables."""
+    """Evaluate FW objects against scope constraints, whitelists, DNS, and routing tables."""
     inactive_objects = []
     logging.info("--- Beginning Inactivity Comparison ---")
     
     for obj in fw_objects:
         obj_name = obj['name']
-        obj_network = obj['network']
+        obj_val = obj['value']
+        obj_type = obj['type']
         
         # 1. Name-based Whitelist Check ("VRF Peer" or similar)
         if 'vrf peer' in obj_name.lower():
-            logging.debug(f"WHITELISTED (NAME): FW Object '{obj_name}' ({obj_network}) contains 'VRF Peer'.")
+            logging.debug(f"WHITELISTED (NAME): FW Object '{obj_name}' ({obj_val}) contains 'VRF Peer'.")
             continue
 
-        # 2. Scope Constraint Check (RFC 1918 + Specific Public Ranges)
+        # 2. FQDN DNS Validation logic
+        if obj_type == 'fqdn':
+            try:
+                socket.gethostbyname(obj_val)
+                logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved to an A record.")
+            except socket.gaierror:
+                logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) failed to resolve.")
+                inactive_objects.append({
+                    'name': obj_name,
+                    'subnet': f"FQDN:{obj_val}",
+                    'type': 'fqdn'
+                })
+            continue
+
+        # 3. Subnet logic starts here
+        obj_network = obj_val
+        
+        # Scope Constraint Check (RFC 1918 + Specific Public Ranges)
         in_target_scope = False
         for target in TARGET_RANGES:
             try:
@@ -252,13 +308,12 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             logging.debug(f"SKIPPED: FW Object '{obj_name}' ({obj_network}) is outside targeted check ranges.")
             continue
             
-        # 3. Whitelist Subnet Exclusion Check (Summary VRF Ranges, etc.)
-        # Reverted back to exact match: Only ignore the object if it exactly matches the whitelisted CIDR range
+        # Whitelist Subnet Exclusion Check (Exact Match)
         if obj_network in whitelist_networks:
             logging.debug(f"WHITELISTED (EXACT MATCH): FW Object '{obj_name}' ({obj_network}) explicitly matches a whitelisted network.")
             continue
 
-        # 4. Active Routing Check (Is it a subset of a known active path?)
+        # Active Routing Check (Is it a subset of a known active path?)
         is_active = False
         for active_net in active_networks:
             try:
@@ -273,7 +328,8 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             logging.warning(f"INACTIVE: FW Object '{obj_name}' ({obj_network}) is NOT found in active routing networks.")
             inactive_objects.append({
                 'name': obj_name,
-                'subnet': str(obj_network)
+                'subnet': str(obj_network),
+                'type': 'subnet'
             })
             
     return inactive_objects
@@ -294,31 +350,43 @@ def export_inactive_to_txt(inactive_objects):
             unique_inactive.append(obj)
             
     inactive_objects = unique_inactive
-    inactive_objects.sort(key=lambda x: ipaddress.ip_network(x['subnet'], strict=False))
+    
+    # Sort subnets first, then FQDNs
+    subnets = [o for o in inactive_objects if o['type'] == 'subnet']
+    fqdns = [o for o in inactive_objects if o['type'] == 'fqdn']
+    subnets.sort(key=lambda x: ipaddress.ip_network(x['subnet'], strict=False))
+    fqdns.sort(key=lambda x: x['name'].lower())
+    
+    sorted_inactive = subnets + fqdns
 
-    logging.info(f"--- Exporting {len(inactive_objects)} unique inactive objects to {OUTPUT_INACTIVE} ---")
+    logging.info(f"--- Exporting {len(sorted_inactive)} unique inactive objects to {OUTPUT_INACTIVE} ---")
     
     unique_names_only = set()
     
     try:
-        # Note: Using csv.writer to maintain exact formatting structure matching previous outputs
         with open(OUTPUT_INACTIVE, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             
-            for obj in inactive_objects:
+            for obj in sorted_inactive:
                 name = obj['name']
                 subnet_str = obj['subnet']
-                net_obj = ipaddress.ip_network(subnet_str, strict=False)
-                base_ip_str = str(net_obj.network_address)
-                
                 unique_names_only.add(name)
                 
-                ip_pattern = r'(?<!\d)' + re.escape(base_ip_str) + r'(?!\d)'
-                
-                if re.search(ip_pattern, name) or subnet_str in name:
-                    writer.writerow([name])
+                if obj['type'] == 'fqdn':
+                    fqdn_val = subnet_str.replace("FQDN:", "")
+                    if fqdn_val in name:
+                        writer.writerow([name])
+                    else:
+                        writer.writerow([name, fqdn_val])
                 else:
-                    writer.writerow([name, subnet_str])
+                    net_obj = ipaddress.ip_network(subnet_str, strict=False)
+                    base_ip_str = str(net_obj.network_address)
+                    ip_pattern = r'(?<!\d)' + re.escape(base_ip_str) + r'(?!\d)'
+                    
+                    if re.search(ip_pattern, name) or subnet_str in name:
+                        writer.writerow([name])
+                    else:
+                        writer.writerow([name, subnet_str])
                     
         logging.info(f"Export complete. Check {OUTPUT_INACTIVE} for objects.")
     except Exception as e:
@@ -337,6 +405,7 @@ def parse_config_for_usage(conf_filepath, inactive_names):
     Checks if any objects in the 'inactive_names' set are actively utilized.
     """
     groups_to_modify = defaultdict(lambda: defaultdict(set))
+    all_group_members = defaultdict(lambda: defaultdict(set))
     policy_usages = []
 
     logging.info("--- Parsing FortiGate Configuration for Object Usage (Phase 2) ---")
@@ -377,6 +446,7 @@ def parse_config_for_usage(conf_filepath, inactive_names):
                         tokens = shlex.split(stripped_line)
                         members = tokens[2:]
                         for m in members:
+                            all_group_members[current_vdom][current_edit].add(m)
                             if m in inactive_names:
                                 groups_to_modify[current_vdom][current_edit].add(m)
                                 logging.info(f"[VDOM: {current_vdom}] Object '{m}' found in Address Group '{current_edit}'. Queued for unselect.")
@@ -401,7 +471,7 @@ def parse_config_for_usage(conf_filepath, inactive_names):
                     except ValueError:
                         logging.warning(f"Line {line_num}: Malformed policy syntax: {stripped_line}")
 
-    return groups_to_modify, policy_usages
+    return groups_to_modify, policy_usages, all_group_members
 
 def generate_policy_report(policy_usages):
     """Write a report detailing which policies are blocking object deletion."""
@@ -434,8 +504,8 @@ def generate_policy_report(policy_usages):
     except Exception as e:
         logging.error(f"Failed to write policy report: {e}")
 
-def generate_fmg_script(groups_to_modify):
-    """Generate the FortiManager CLI script (Group removal unselect commands only)."""
+def generate_fmg_script(groups_to_modify, all_group_members):
+    """Generate the FortiManager CLI script, applying Recursive Group Analysis."""
     if not groups_to_modify:
         logging.info("No groups require modification. Skipping FMG script generation.")
         return
@@ -448,6 +518,8 @@ def generate_fmg_script(groups_to_modify):
             f.write("# FortiManager CLI Script - Inactive Address Group Cleanup\n")
             f.write("# Target: FortiOS 7.6 (Device Manager -> Scripts)\n")
             f.write("# This script explicitly unbinds inactive objects from Address Groups.\n")
+            f.write("# Recursive Analysis: If a group becomes totally empty, it flags and\n")
+            f.write("# issues a bulk 'delete' command for the entire group.\n")
             f.write("# Bulk object deletions are handled natively via FMG UI tooling.\n")
             f.write("# ==================================================================\n\n")
             
@@ -458,13 +530,21 @@ def generate_fmg_script(groups_to_modify):
                 f.write(f"config vdom\n")
                 f.write(f"edit \"{vdom}\"\n\n")
                 
-                # Strip the objects out of any address groups in this VDOM
                 f.write("    config firewall addrgrp\n")
-                for group_name, members in vdom_groups.items():
-                    f.write(f"        edit \"{group_name}\"\n")
-                    for member in members:
-                        f.write(f"            unselect member \"{member}\"\n")
-                    f.write("        next\n")
+                for group_name, members_to_remove in vdom_groups.items():
+                    total_members = len(all_group_members[vdom][group_name])
+                    removing_count = len(members_to_remove)
+                    
+                    # Recursive Group Analysis: Is the group entirely empty now?
+                    if total_members == removing_count and total_members > 0:
+                        logging.info(f"[VDOM: {vdom}] Address Group '{group_name}' will become EMPTY. Flagging for full deletion.")
+                        f.write(f"        delete \"{group_name}\"\n")
+                    else:
+                        f.write(f"        edit \"{group_name}\"\n")
+                        for member in members_to_remove:
+                            f.write(f"            unselect member \"{member}\"\n")
+                        f.write("        next\n")
+                        
                 f.write("    end\n\n")
                 f.write("next\n\n")
                 
@@ -485,21 +565,24 @@ if __name__ == "__main__":
     active_nets = load_networks_from_file(routing_file, "Active Networks")
     whitelist_nets = load_networks_from_file(whitelist_file, "Summary Ranges")
     
-    # 3. [Phase 1] Extract FortiOS firewall objects
+    # 3. [Phase 1] Extract FortiOS firewall objects (Subnets & FQDNs)
     fw_objs = parse_fortigate_objects(conf_file)
     
-    # 4. [Phase 1] Evaluate objects for inactivity
+    # 4. [Phase 1] Diagnose subnet overlaps/redundancies
+    check_redundant_subnets(fw_objs)
+    
+    # 5. [Phase 1] Evaluate objects for inactivity
     inactive_data = compare_and_find_inactive(fw_objs, active_nets, whitelist_nets)
     
-    # 5. [Phase 1] Output the initial evaluation and retain the set of unique names 
+    # 6. [Phase 1] Output the initial evaluation and retain the set of unique names 
     inactive_obj_names = export_inactive_to_txt(inactive_data)
     
     if inactive_obj_names:
-        # 6. [Phase 2] Parse the config again for Group and Policy usages
-        grps_to_modify, pol_usages = parse_config_for_usage(conf_file, inactive_obj_names)
+        # 7. [Phase 2] Parse the config again for Group and Policy usages
+        grps_to_modify, pol_usages, all_grp_members = parse_config_for_usage(conf_file, inactive_obj_names)
         
-        # 7. [Phase 2] Generate outputs for FMG UI handling
+        # 8. [Phase 2] Generate outputs for FMG UI handling
         generate_policy_report(pol_usages)
-        generate_fmg_script(grps_to_modify)
+        generate_fmg_script(grps_to_modify, all_grp_members)
     
     logging.info("Comprehensive script execution finished.")
