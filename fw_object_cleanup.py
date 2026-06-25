@@ -239,17 +239,9 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             continue
             
         # 3. Whitelist Subnet Exclusion Check (Summary VRF Ranges, etc.)
-        is_whitelisted = False
-        for whitelist_net in whitelist_networks:
-            try:
-                if obj_network.subnet_of(whitelist_net):
-                    logging.debug(f"WHITELISTED (SUBNET): FW Object '{obj_name}' ({obj_network}) is within whitelist range ({whitelist_net}).")
-                    is_whitelisted = True
-                    break
-            except TypeError:
-                continue
-                
-        if is_whitelisted:
+        # Reverted back to exact match: Only ignore the object if it exactly matches the whitelisted CIDR range
+        if obj_network in whitelist_networks:
+            logging.debug(f"WHITELISTED (EXACT MATCH): FW Object '{obj_name}' ({obj_network}) explicitly matches a whitelisted network.")
             continue
 
         # 4. Active Routing Check (Is it a subset of a known active path?)
