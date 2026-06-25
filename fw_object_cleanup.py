@@ -5,7 +5,7 @@ This script performs a comprehensive two-phase cleanup of FortiGate address obje
 
 Phase 1: Analysis & Identification
 - Parses a FortiOS configuration file for all address objects (Subnets & FQDNs).
-- Validates FQDN objects against live DNS queries to ensure active A records or CNAME aliases.
+- Validates FQDN objects against live DNS queries concurrently to ensure active A records or CNAME aliases.
 - Compares Subnet objects against a master list of active routing networks.
 - Bypasses objects based on scope (RFC 1918) and whitelist criteria.
 - Outputs unused objects to './outputs/inactive_objects.txt'.
@@ -13,10 +13,9 @@ Phase 1: Analysis & Identification
 Phase 2: FortiManager CLI Preparation
 - Scans the FortiOS configuration again to map VDOMs, Groups, and Policies.
 - Identifies if any of the inactive objects are actively referenced.
-- Generates FMG CLI syntax ('./outputs/fmg_script_config.txt') to safely unbind objects from groups and policies.
+- Generates FMG CLI syntax ('./outputs/fmg_script_config.txt') to safely unbind objects from groups.
 - Performs Recursive Group Analysis: Flags and deletes groups that become entirely empty.
-- Performs Recursive Policy Analysis: Flags and deletes policies that lose all source or destination addresses.
-- Generates an audit cleanup report ('./outputs/policy_id_cleanup.txt') detailing policy adjustments.
+- Generates a manual cleanup audit report ('./outputs/policy_id_cleanup.txt') detailing policy blockages.
 """
 
 import os
@@ -27,6 +26,7 @@ import ipaddress
 import re
 import shlex
 import socket
+import concurrent.futures
 from collections import defaultdict
 
 try:
@@ -239,9 +239,37 @@ def parse_fortigate_objects(conf_filepath):
     logging.info(f"Successfully parsed {len(fw_objects)} address objects from the firewall.")
     return fw_objects
 
+def check_fqdn_active(obj):
+    """Worker function for threading FQDN DNS validation."""
+    obj_name = obj['name']
+    obj_val = obj['value']
+    
+    # Clean the FQDN and strip wildcard syntax (*.domain.com -> domain.com) for valid DNS querying
+    fqdn_to_test = obj_val.strip().strip('"').strip("'")
+    if fqdn_to_test.startswith("*."):
+        fqdn_to_test = fqdn_to_test[2:]
+        
+    try:
+        # getaddrinfo is the most robust Python resolver. It handles CNAME chaining cleanly.
+        socket.getaddrinfo(fqdn_to_test, None)
+        logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved.")
+        return None  # Return nothing if it's an active/valid FQDN
+    except socket.gaierror as e:
+        logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) failed to resolve: {e}")
+        return {
+            'name': obj_name,
+            'subnet': f"FQDN:{obj_val}",
+            'type': 'fqdn'
+        }
+    except Exception as e:
+        logging.error(f"ERROR (DNS): Failed to query FQDN '{obj_name}' ({obj_val}): {e}")
+        return None
+
 def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
-    """Evaluate FW objects against scope constraints, whitelists, DNS, and routing tables."""
+    """Evaluate FW objects against scope constraints, whitelists, DNS (multi-threaded), and routing tables."""
     inactive_objects = []
+    fqdns_to_check = []
+    
     logging.info("--- Beginning Inactivity Comparison ---")
     
     for obj in fw_objects:
@@ -254,29 +282,12 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
             logging.debug(f"WHITELISTED (NAME): FW Object '{obj_name}' ({obj_val}) contains 'VRF Peer'.")
             continue
 
-        # 2. FQDN DNS Validation logic
+        # 2. Queue FQDNs for concurrent DNS Validation later
         if obj_type == 'fqdn':
-            # Clean the FQDN and strip wildcard syntax (*.domain.com -> domain.com) for valid DNS querying
-            fqdn_to_test = obj_val.strip().strip('"').strip("'")
-            if fqdn_to_test.startswith("*."):
-                fqdn_to_test = fqdn_to_test[2:]
-                
-            try:
-                # getaddrinfo is the most robust Python resolver. It handles CNAME chaining cleanly.
-                socket.getaddrinfo(fqdn_to_test, None)
-                logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved.")
-            except socket.gaierror as e:
-                logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) failed to resolve: {e}")
-                inactive_objects.append({
-                    'name': obj_name,
-                    'subnet': f"FQDN:{obj_val}",
-                    'type': 'fqdn'
-                })
-            except Exception as e:
-                logging.error(f"ERROR (DNS): Failed to query FQDN '{obj_name}' ({obj_val}): {e}")
+            fqdns_to_check.append(obj)
             continue
 
-        # 3. Subnet logic starts here
+        # 3. Subnet logic begins here
         obj_network = obj_val
         
         # Scope Constraint Check (RFC 1918 + Specific Public Ranges)
@@ -316,6 +327,20 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
                 'subnet': str(obj_network),
                 'type': 'subnet'
             })
+
+    # Execute Concurrent FQDN Lookups
+    if fqdns_to_check:
+        logging.info(f"--- Starting Concurrent DNS Lookups for {len(fqdns_to_check)} FQDNs ---")
+        
+        # Use 30 threads to significantly speed up DNS queries without overwhelming the local resolver
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+            # Map the helper function to our queued FQDN objects
+            results = executor.map(check_fqdn_active, fqdns_to_check)
+            
+            # Any result returned is an inactive FQDN dictionary
+            for result in results:
+                if result:
+                    inactive_objects.append(result)
             
     return inactive_objects
 
@@ -356,15 +381,15 @@ def export_inactive_to_txt(inactive_objects):
                 name = obj['name']
                 subnet_str = obj['subnet']
                 
-                # Store the object's type for the policy report
-                inactive_obj_dict[name] = obj['type']
+                # Store the object's type and context value for the policy report tweak
+                context_val = subnet_str.replace("FQDN:", "") if obj['type'] == 'fqdn' else subnet_str
+                inactive_obj_dict[name] = {'type': obj['type'], 'value': context_val}
                 
                 if obj['type'] == 'fqdn':
-                    fqdn_val = subnet_str.replace("FQDN:", "")
-                    if fqdn_val in name:
+                    if context_val in name:
                         writer.writerow([name])
                     else:
-                        writer.writerow([name, fqdn_val])
+                        writer.writerow([name, context_val])
                 else:
                     net_obj = ipaddress.ip_network(subnet_str, strict=False)
                     base_ip_str = str(net_obj.network_address)
@@ -395,11 +420,6 @@ def parse_config_for_usage(conf_filepath, inactive_dict):
     groups_to_modify = defaultdict(lambda: defaultdict(set))
     all_group_members = defaultdict(lambda: defaultdict(set))
     policy_usages = []
-    
-    # Advanced tracking for Policy Source/Destinations
-    all_policy_srcaddr = defaultdict(lambda: defaultdict(set))
-    all_policy_dstaddr = defaultdict(lambda: defaultdict(set))
-    policies_to_modify = defaultdict(lambda: defaultdict(lambda: {'srcaddr': set(), 'dstaddr': set()}))
 
     logging.info("--- Parsing FortiGate Configuration for Object Usage (Phase 2) ---")
 
@@ -464,28 +484,23 @@ def parse_config_for_usage(conf_filepath, inactive_dict):
                         direction = tokens[1] 
                         members = tokens[2:]
                         for m in members:
-                            if direction == "srcaddr":
-                                all_policy_srcaddr[current_vdom][current_edit].add(m)
-                            elif direction == "dstaddr":
-                                all_policy_dstaddr[current_vdom][current_edit].add(m)
-                                
                             if m in inactive_dict:
-                                policies_to_modify[current_vdom][current_edit][direction].add(m)
                                 policy_usages.append({
                                     'vdom': current_vdom,
                                     'policy_id': current_edit,
                                     'direction': direction,
                                     'object': m,
-                                    'type': inactive_dict[m]
+                                    'type': inactive_dict[m]['type'],
+                                    'value': inactive_dict[m]['value']
                                 })
-                                logging.info(f"[VDOM: {current_vdom}] Policy {current_edit} uses '{m}' as {direction}. Queued for removal.")
+                                logging.warning(f"[VDOM: {current_vdom}] Policy {current_edit} is actively using target object '{m}' as {direction}.")
                     except ValueError:
                         logging.warning(f"Line {line_num}: Malformed policy syntax: {stripped_line}")
 
-    return groups_to_modify, policy_usages, all_group_members, policies_to_modify, all_policy_srcaddr, all_policy_dstaddr
+    return groups_to_modify, policy_usages, all_group_members
 
 def generate_policy_report(policy_usages):
-    """Write an audit report detailing which policies required modification."""
+    """Write an audit report detailing which policies require manual cleanup."""
     if not policy_usages:
         logging.info(f"No active firewall policies are using these objects. Skipping {POLICY_REPORT}.")
         return
@@ -497,10 +512,11 @@ def generate_policy_report(policy_usages):
     try:
         with open(POLICY_REPORT, mode='w', encoding='utf-8') as f:
             f.write("======================================================================\n")
-            f.write("                       POLICY CLEANUP AUDIT\n")
+            f.write("                       POLICY CLEANUP REQUIRED\n")
             f.write("======================================================================\n")
-            f.write("The following objects were actively found in Firewall Policies.\n")
-            f.write("The generated FMG script will attempt to unselect these automatically.\n")
+            f.write("The following objects are actively used in Firewall Policies.\n")
+            f.write("You must manually remove them from these policies via the FortiManager\n")
+            f.write("GUI before FortiOS will allow them to be safely deleted.\n")
             f.write("======================================================================\n\n")
             
             for usage in policy_usages:
@@ -508,6 +524,7 @@ def generate_policy_report(policy_usages):
                 f.write(f"Policy ID:  {usage['policy_id']}\n")
                 f.write(f"Direction:  {usage['direction']}\n")
                 f.write(f"Object:     \"{usage['object']}\"\n")
+                f.write(f"Value:      {usage['value']}\n")
                 
                 # Report if it is an FQDN or Subnet object
                 obj_type_str = "FQDN" if usage['type'] == 'fqdn' else "Subnet/Address"
@@ -518,12 +535,10 @@ def generate_policy_report(policy_usages):
     except Exception as e:
         logging.error(f"Failed to write policy report: {e}")
 
-def generate_fmg_script(groups_to_modify, all_group_members, policies_to_modify, all_policy_srcaddr, all_policy_dstaddr):
-    """Generate the FortiManager CLI script, applying Recursive Analysis on Groups and Policies."""
-    vdoms_to_process = set(list(groups_to_modify.keys()) + list(policies_to_modify.keys()))
-    
-    if not vdoms_to_process:
-        logging.info("No groups or policies require modification. Skipping FMG script generation.")
+def generate_fmg_script(groups_to_modify, all_group_members):
+    """Generate the FortiManager CLI script, applying Recursive Analysis on Groups."""
+    if not groups_to_modify:
+        logging.info("No groups require modification. Skipping FMG script generation.")
         return
 
     logging.info(f"--- Generating FortiManager CLI Script ({OUTPUT_FMG_CONFIG}) ---")
@@ -531,65 +546,38 @@ def generate_fmg_script(groups_to_modify, all_group_members, policies_to_modify,
     try:
         with open(OUTPUT_FMG_CONFIG, mode='w', encoding='utf-8') as f:
             f.write("# ==================================================================\n")
-            f.write("# FortiManager CLI Script - Inactive Address Group & Policy Cleanup\n")
+            f.write("# FortiManager CLI Script - Inactive Address Group Cleanup\n")
             f.write("# Target: FortiOS 7.6 (Device Manager -> Scripts)\n")
             f.write("# \n")
-            f.write("# This script explicitly unbinds inactive objects from Address Groups\n")
-            f.write("# and Firewall Policies.\n")
-            f.write("# \n")
-            f.write("# Recursive Analysis:\n")
-            f.write("# - If a Group becomes totally empty, it flags and issues a full delete.\n")
-            f.write("# - If a Policy loses all its source/destination objects, it flags\n")
-            f.write("#   and issues a full delete for the policy itself.\n")
+            f.write("# This script explicitly unbinds inactive objects from Address Groups.\n")
+            f.write("# Recursive Analysis: If a group becomes totally empty, it flags and\n")
+            f.write("# issues a bulk 'delete' command for the entire group.\n")
+            f.write("# Bulk object deletions are handled natively via FMG UI tooling.\n")
             f.write("# ==================================================================\n\n")
             
-            for vdom in sorted(vdoms_to_process):
-                vdom_groups = groups_to_modify.get(vdom, {})
-                vdom_policies = policies_to_modify.get(vdom, {})
-                
+            for vdom, vdom_groups in groups_to_modify.items():
+                if not vdom_groups:
+                    continue
+                    
                 f.write(f"config vdom\n")
                 f.write(f"edit \"{vdom}\"\n\n")
                 
-                # --- Groups Logic ---
-                if vdom_groups:
-                    f.write("    config firewall addrgrp\n")
-                    for group_name, members_to_remove in vdom_groups.items():
-                        total_members = len(all_group_members[vdom][group_name])
-                        removing_count = len(members_to_remove)
-                        
-                        # Recursive Group Analysis: Is the group entirely empty now?
-                        if total_members == removing_count and total_members > 0:
-                            logging.info(f"[VDOM: {vdom}] Address Group '{group_name}' will become EMPTY. Flagging for full deletion.")
-                            f.write(f"        delete \"{group_name}\"\n")
-                        else:
-                            f.write(f"        edit \"{group_name}\"\n")
-                            for member in members_to_remove:
-                                f.write(f"            unselect member \"{member}\"\n")
-                            f.write("        next\n")
-                    f.write("    end\n\n")
+                f.write("    config firewall addrgrp\n")
+                for group_name, members_to_remove in vdom_groups.items():
+                    total_members = len(all_group_members[vdom][group_name])
+                    removing_count = len(members_to_remove)
                     
-                # --- Policy Logic ---
-                if vdom_policies:
-                    f.write("    config firewall policy\n")
-                    for pol_id, modifications in vdom_policies.items():
-                        src_total = len(all_policy_srcaddr[vdom][pol_id])
-                        dst_total = len(all_policy_dstaddr[vdom][pol_id])
-                        src_removing = len(modifications['srcaddr'])
-                        dst_removing = len(modifications['dstaddr'])
+                    # Recursive Group Analysis: Is the group entirely empty now?
+                    if total_members == removing_count and total_members > 0:
+                        logging.info(f"[VDOM: {vdom}] Address Group '{group_name}' will become EMPTY. Flagging for full deletion.")
+                        f.write(f"        delete \"{group_name}\"\n")
+                    else:
+                        f.write(f"        edit \"{group_name}\"\n")
+                        for member in members_to_remove:
+                            f.write(f"            unselect member \"{member}\"\n")
+                        f.write("        next\n")
                         
-                        # Recursive Policy Analysis: Would this leave the policy with no src or dst?
-                        if (src_total > 0 and src_total == src_removing) or (dst_total > 0 and dst_total == dst_removing):
-                            logging.info(f"[VDOM: {vdom}] Policy {pol_id} will have an empty srcaddr/dstaddr field. Flagging for full deletion.")
-                            f.write(f"        delete {pol_id}\n")
-                        else:
-                            f.write(f"        edit {pol_id}\n")
-                            for member in modifications['srcaddr']:
-                                f.write(f"            unselect srcaddr \"{member}\"\n")
-                            for member in modifications['dstaddr']:
-                                f.write(f"            unselect dstaddr \"{member}\"\n")
-                            f.write("        next\n")
-                    f.write("    end\n\n")
-                    
+                f.write("    end\n\n")
                 f.write("next\n\n")
                 
         logging.info(f"Success! Script written to '{OUTPUT_FMG_CONFIG}'.")
@@ -612,18 +600,18 @@ if __name__ == "__main__":
     # 3. [Phase 1] Extract FortiOS firewall objects (Subnets & FQDNs)
     fw_objs = parse_fortigate_objects(conf_file)
     
-    # 4. [Phase 1] Evaluate objects for inactivity
+    # 4. [Phase 1] Evaluate objects for inactivity (now uses threading for FQDNs)
     inactive_data = compare_and_find_inactive(fw_objs, active_nets, whitelist_nets)
     
-    # 5. [Phase 1] Output the initial evaluation and retain dictionary of names/types
+    # 5. [Phase 1] Output the initial evaluation and retain dictionary of names/types/values
     inactive_obj_dict = export_inactive_to_txt(inactive_data)
     
     if inactive_obj_dict:
         # 6. [Phase 2] Parse the config again for Group and Policy usages
-        grps_to_modify, pol_usages, all_grp_members, pols_to_mod, all_pol_src, all_pol_dst = parse_config_for_usage(conf_file, inactive_obj_dict)
+        grps_to_modify, pol_usages, all_grp_members = parse_config_for_usage(conf_file, inactive_obj_dict)
         
         # 7. [Phase 2] Generate outputs for FMG UI handling
         generate_policy_report(pol_usages)
-        generate_fmg_script(grps_to_modify, all_grp_members, pols_to_mod, all_pol_src, all_pol_dst)
+        generate_fmg_script(grps_to_modify, all_grp_members)
     
     logging.info("Comprehensive script execution finished.")
