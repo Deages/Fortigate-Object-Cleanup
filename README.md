@@ -1,181 +1,452 @@
-# FortiGate Address Object Cleanup Tool
+# FortiGate & FortiManager Address Object Cleanup Tool
 
-A Python automation script designed for enterprise FortiGate environments to identify and clean up stale, unused, or orphaned firewall address objects.
+A Python automation tool designed to identify unused FortiGate firewall address objects, validate them against active routing networks, and generate FortiManager cleanup artifacts for safe removal.
 
-When migrating services or restructuring networks (especially in environments utilizing VRFs and multiple VDOMs), address objects are frequently left behind in the configuration. This script parses a FortiOS 7.4 configuration file, compares all configured address objects against a master list of active IP routing networks, and outputs a formatted, deduplicated CSV of objects that are safe to delete.
+## Overview
 
+Managing address objects across large FortiGate deployments can become difficult over time as legacy subnets, decommissioned services, and stale network entries accumulate.
 
-## Quick start guide:
+This tool performs a **two-phase analysis and cleanup preparation workflow**:
 
-- Step 1: Create a whitelist.txt file with each IP/object you want to whitelist from being marked as inactive.
-- Step 2: Create a txt file, csv or xlsx file (e.g. networks.txt) that has all the active networks in your environment, line separated.
-- Step 3: Make sure your fortigate config file is in the same directory.
-- Step 4: run python3 fw_cleanup_check.py and check inactive_addresses.csv for the output.
-- Step 5: run fmg_inactive_cleanup.py
-- Step 6: copy the contents of "fmg_script_output.txt" into your FortiManager Scripts section and run it.
+### Phase 1 – Analysis & Identification
 
+* Parses a FortiGate/FortiOS configuration backup.
+* Extracts all firewall address objects.
+* Compares objects against active routing network data.
+* Excludes:
 
----
+  * RFC1918 and targeted public range exceptions
+  * Whitelisted networks
+  * Name-based exclusions (e.g. "VRF Peer")
+* Produces a report of potentially inactive objects.
 
-## Features
+### Phase 2 – FortiManager Cleanup Preparation
 
-### Multi-VDOM Support
-Safely parses the firewall address blocks scattered across multiple Virtual Domains without halting on the first `end` statement.
+* Re-parses the FortiOS configuration.
+* Detects inactive objects that are still referenced.
+* Identifies:
 
-### CIDR & Subnet Intelligence
-Uses hierarchical subset logic. If a FortiGate object like `10.1.5.1/32` exists, it will validate it as in-use if a larger parent network like `10.1.5.0/24` exists in your routing table.
+  * Address Groups
+  * Firewall Policies
+  * VDOM ownership
+* Generates:
 
-### Scope Constrained
-Specifically targets RFC 1918 private address space and defined public ranges (`129.78.0.0/16`) to avoid accidentally flagging external third-party IPs that obviously won't exist in local routing tables.
-
-### Whitelist Protection
-Supports a `whitelist.txt` file to explicitly protect summary ranges or specific administrative subnets from deletion.
-
-### Smart Formatting & Deduplication
-Sorts the output numerically by IP address, removes VDOM/VRF duplicates, and intelligently cleans the output string if an IP is already built into the object's name.
-
-**Example:**
-
-```text
-h_10.1.1.5
-```
-
-Instead of:
-
-```text
-h_10.1.1.5,10.1.1.5/32
-```
-
-### Forensic Logging
-Generates a verbose `.txt` log file to provide an exact audit trail of why an object was marked valid or invalid for peer review.
+  * FortiManager CLI cleanup script
+  * Policy remediation report
 
 ---
 
-## Nuances:
-- It's hard coded to ignore 129.78.0.0/16 since that's our org IP range.
-- It's hard coded to ignore any object that has "VRF Peer" in the name for our use cases.
+# Features
 
-## Prerequisites
+✅ Automatic input file discovery
 
-- Python 3.x
-- Required libraries:
-  - `pandas`
-  - `openpyxl` (required for handling `.xlsx` files)
+✅ Supports routing data from:
 
-### Install Dependencies
+* CSV
+* XLSX
+* TXT
 
-Using a Python virtual environment:
+✅ RFC1918-aware object filtering
+
+✅ Custom subnet whitelisting
+
+✅ Address Group dependency tracking
+
+✅ Firewall Policy dependency tracking
+
+✅ VDOM-aware analysis
+
+✅ FortiManager CLI script generation
+
+✅ Comprehensive logging
+
+---
+
+# Directory Structure
+
+```text
+project/
+│
+├── inputs/
+│   ├── firewall.conf
+│   ├── active_networks.xlsx
+│   └── whitelist.txt
+│
+├── outputs/
+│   ├── inactive_objects.txt
+│   ├── fmg_script_config.txt
+│   ├── policy_id_cleanup.txt
+│   └── logs/
+│       └── script_log.txt
+│
+└── fortigate_cleanup.py
+```
+
+---
+
+# Requirements
+
+## Python Version
+
+Python 3.9+
+
+## Dependencies
 
 ```bash
-python -m venv venv
-
-# Linux/macOS
-source venv/bin/activate
-
-# Windows
-venv\Scripts\activate
-
 pip install pandas openpyxl
 ```
 
+### Libraries Used
+
+| Library   | Purpose                |
+| --------- | ---------------------- |
+| pandas    | XLSX processing        |
+| openpyxl  | Excel file support     |
+| ipaddress | CIDR calculations      |
+| csv       | CSV parsing            |
+| logging   | Execution logging      |
+| glob      | File discovery         |
+| shlex     | FortiOS syntax parsing |
+| re        | Pattern matching       |
+
 ---
 
-## File Structure & Usage
+# Input Files
 
-The script is designed to run locally within a directory and will automatically discover the files it needs.
+Place all required files inside the `inputs/` directory.
 
-Place the following files in the same directory as `fw_cleanup_check.py`:
+## 1. FortiGate Configuration
 
-### 1. Firewall Configuration
-
-Your FortiGate backup file:
-
-- `.conf`
-- `.txt` (with `fw` or `conf` in the filename)
-
-### 2. Active Networks File
-
-A file containing active subnets in standard CIDR notation:
-
-**Supported formats:**
-
-- `.csv`
-- `.xlsx`
-- `.txt`
-
-**Example contents:**
+Supported formats:
 
 ```text
-10.1.1.0/24
-10.1.2.0/24
+*.conf
+```
+
+or
+
+```text
+*.txt
+```
+
+Filename must contain either:
+
+```text
+fw
+```
+
+or
+
+```text
+conf
+```
+
+Example:
+
+```text
+customer-fw.conf
+```
+
+---
+
+## 2. Active Networks File
+
+Supported formats:
+
+```text
+.csv
+.xlsx
+.txt
+```
+
+Example contents:
+
+```text
+10.10.0.0/16
+10.20.0.0/16
 172.16.100.0/24
+129.78.50.0/24
 ```
 
-The script automatically ignores headers and extracts IP networks.
+The script treats these networks as active routing paths.
 
-### 3. Whitelist (Optional)
+Any firewall object that is a subnet of one of these entries is considered active.
 
-A file named exactly:
+---
+
+## 3. Optional Whitelist
+
+Create:
 
 ```text
-whitelist.txt
+inputs/whitelist.txt
 ```
 
-Containing CIDR ranges that should be excluded from cleanup analysis.
-
-**Example:**
+Example:
 
 ```text
 10.0.0.0/8
-172.16.0.0/12
+172.20.0.0/16
+192.168.0.0/16
+```
+
+Objects that exactly match a whitelisted subnet are excluded from analysis.
+
+---
+
+# Scope of Evaluation
+
+The script only evaluates address objects contained within the following ranges:
+
+| Range          | Description         |
+| -------------- | ------------------- |
+| 10.0.0.0/8     | RFC1918             |
+| 172.16.0.0/12  | RFC1918             |
+| 192.168.0.0/16 | RFC1918             |
+| 129.78.0.0/16  | Custom Public Range |
+
+Objects outside these ranges are ignored.
+
+---
+
+# How It Works
+
+## Phase 1: Address Object Analysis
+
+The script scans:
+
+```fortios
+config firewall address
+    edit "Server_Network"
+        set subnet 10.10.10.0 255.255.255.0
+    next
+end
+```
+
+Extracted objects are evaluated against:
+
+1. Name whitelist
+2. Scope filters
+3. Network whitelist
+4. Active routing table
+
+Inactive objects are written to:
+
+```text
+outputs/inactive_objects.txt
 ```
 
 ---
 
-## Running the Script
+## Phase 2: Usage Analysis
 
-Execute the script with Python:
+The configuration is scanned again to locate references within:
+
+### Address Groups
+
+Example:
+
+```fortios
+config firewall addrgrp
+    edit "Servers"
+        set member "Server_Network"
+    next
+end
+```
+
+### Firewall Policies
+
+Example:
+
+```fortios
+config firewall policy
+    edit 100
+        set srcaddr "Server_Network"
+    next
+end
+```
+
+---
+
+# Output Files
+
+## inactive_objects.txt
+
+List of all identified inactive objects.
+
+Example:
+
+```text
+Legacy_Server_Net,10.10.50.0/24
+Old_DMZ,172.16.99.0/24
+```
+
+---
+
+## fmg_script_config.txt
+
+Generated FortiManager CLI script.
+
+Example:
+
+```fortios
+config vdom
+edit "root"
+
+    config firewall addrgrp
+        edit "Servers"
+            unselect member "Legacy_Server_Net"
+        next
+    end
+
+next
+```
+
+Used to remove inactive objects from address groups before deletion.
+
+---
+
+## policy_id_cleanup.txt
+
+Generated when inactive objects are still referenced by firewall policies.
+
+Example:
+
+```text
+VDOM:       root
+Policy ID:  100
+Direction:  srcaddr
+Object:     "Legacy_Server_Net"
+```
+
+These objects must be manually removed from policies before deletion is possible.
+
+---
+
+## logs/script_log.txt
+
+Complete execution log containing:
+
+* File discovery
+* Parsing activity
+* Object validation
+* Group membership tracking
+* Policy dependency tracking
+* Errors and warnings
+
+---
+
+# Running the Script
 
 ```bash
-python fw_cleanup_check.py
+python fortigate_cleanup.py
+```
+
+Example output:
+
+```text
+Starting Comprehensive FortiGate Object Cleanup Check...
+
+Selected FortiGate Config:
+customer-fw.conf
+
+Selected Active Networks File:
+active_networks.xlsx
+
+Successfully parsed 342 subnet address objects.
+
+Found 27 inactive objects.
+
+Generating FortiManager CLI Script...
+
+Comprehensive script execution finished.
 ```
 
 ---
 
-## Outputs
+# Cleanup Workflow
 
-Upon execution, the script generates two files in the working directory.
+Recommended operational process:
 
-### `inactive_addresses.csv`
-
-A finalized, deduplicated, and numerically sorted list of firewall address objects that are ready to be deleted from the FortiGate configuration.
-
-### `script_log.txt`
-
-A detailed debugging and audit log showing:
-
-- How each FortiGate object was evaluated
-- Which whitelist entry it matched (if any)
-- Which active subnet validated the object
-- Why the object was marked valid or invalid
-
-This provides a complete audit trail for peer review and change-control processes.
-
-### `fmg_script_output.txt`
-
-A copy/paste block of text for your FortiManager so that you can import it into Device Manager -> Scripts -> run it.
+```text
+1. Export FortiGate configuration
+          ↓
+2. Export active routing networks
+          ↓
+3. Run script
+          ↓
+4. Review inactive_objects.txt
+          ↓
+5. Review policy_id_cleanup.txt
+          ↓
+6. Remove policy references manually
+          ↓
+7. Run generated FMG script
+          ↓
+8. Delete objects via FortiManager
+```
 
 ---
 
-## Use Case
+# Safety Mechanisms
 
-This tool is particularly useful during:
+The script intentionally avoids false positives by:
 
-- Network migrations
-- VRF consolidations
-- VDOM restructures
-- Firewall cleanup projects
-- Configuration hygiene reviews
-- Pre-upgrade configuration audits
+* Limiting evaluation scope to approved ranges
+* Supporting whitelist exclusions
+* Tracking address group membership
+* Tracking firewall policy references
+* Generating remediation reports before deletion actions
 
-By comparing configured address objects against known active routing networks, the script helps identify legacy objects that can be safely removed while reducing the risk of deleting valid entries.
+No configuration changes are made directly to:
+
+* FortiGate
+* FortiManager
+* Firewall Policies
+* Address Objects
+
+The script only generates analysis and cleanup artifacts.
+
+---
+
+# Example Use Cases
+
+* Firewall object hygiene audits
+* FortiManager cleanup projects
+* Migration preparation
+* Rulebase rationalization
+* Legacy subnet retirement
+* VDOM environment cleanup
+
+---
+
+# Limitations
+
+Current version supports:
+
+* IPv4 subnet address objects
+* Standard FortiOS configuration exports
+* Address Groups
+* Firewall Policies
+
+Not currently supported:
+
+* FQDN objects
+* Dynamic objects
+* IPv6 objects
+* Nested address group dependency analysis
+* Direct API integration
+
+---
+
+# License
+
+This project is provided as-is without warranty.
+
+Validate all generated outputs in a non-production environment before making firewall changes.
+
+---
+
+# Author
+
+Network Automation & Security Operations Tooling
