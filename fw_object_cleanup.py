@@ -5,9 +5,8 @@ This script performs a comprehensive two-phase cleanup of FortiGate address obje
 
 Phase 1: Analysis & Identification
 - Parses a FortiOS configuration file for all address objects (Subnets & FQDNs).
-- Validates FQDN objects against live DNS queries to ensure active A records.
+- Validates FQDN objects against live DNS queries to ensure active A records or CNAME aliases.
 - Compares Subnet objects against a master list of active routing networks.
-- Flags and alerts on redundant subnet objects (e.g., overlapping subsets).
 - Bypasses objects based on scope (RFC 1918) and whitelist criteria.
 - Outputs unused objects to './outputs/inactive_objects.txt'.
 
@@ -239,38 +238,6 @@ def parse_fortigate_objects(conf_filepath):
     logging.info(f"Successfully parsed {len(fw_objects)} address objects from the firewall.")
     return fw_objects
 
-def check_redundant_subnets(fw_objects, whitelist_networks):
-    """Diagnoses and alerts on objects that are strict subsets of other objects."""
-    logging.info("--- Performing Enhanced Subnet Overlap Detection ---")
-    subnets = [o for o in fw_objects if o['type'] == 'subnet']
-    redundancy_count = 0
-    
-    for obj1 in subnets:
-        for obj2 in subnets:
-            if obj1['name'] == obj2['name']:
-                continue
-            
-            # Ignore overlap checks against large summary routes (/16, /8, etc.)
-            if obj2['value'].prefixlen <= 16:
-                continue
-                
-            # Ignore overlap checks against any explicitly whitelisted networks
-            if obj2['value'] in whitelist_networks:
-                continue
-
-            # Alert if obj1 is completely encompassed by obj2 (but smaller)
-            try:
-                if obj1['value'].subnet_of(obj2['value']) and obj1['value'].prefixlen > obj2['value'].prefixlen:
-                    logging.warning(f"REDUNDANCY ALERT: Object '{obj1['name']}' ({obj1['value']}) is a strict subset of '{obj2['name']}' ({obj2['value']}).")
-                    redundancy_count += 1
-            except TypeError:
-                pass
-
-    if redundancy_count == 0:
-        logging.info("No redundant subnet overlaps found.")
-    else:
-        logging.info(f"Subnet overlap check complete. Found {redundancy_count} potential redundancies.")
-
 def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
     """Evaluate FW objects against scope constraints, whitelists, DNS, and routing tables."""
     inactive_objects = []
@@ -289,10 +256,11 @@ def compare_and_find_inactive(fw_objects, active_networks, whitelist_networks):
         # 2. FQDN DNS Validation logic
         if obj_type == 'fqdn':
             try:
-                socket.gethostbyname(obj_val)
-                logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved to an A record.")
+                # gethostbyname_ex automatically follows CNAME aliases and fetches A records
+                socket.gethostbyname_ex(obj_val)
+                logging.debug(f"VALID (DNS): FQDN Object '{obj_name}' ({obj_val}) successfully resolved to an A record or CNAME.")
             except socket.gaierror:
-                logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) failed to resolve.")
+                logging.warning(f"INACTIVE (DNS): FQDN Object '{obj_name}' ({obj_val}) returned NXDOMAIN (Non-existent domain).")
                 inactive_objects.append({
                     'name': obj_name,
                     'subnet': f"FQDN:{obj_val}",
@@ -577,20 +545,17 @@ if __name__ == "__main__":
     # 3. [Phase 1] Extract FortiOS firewall objects (Subnets & FQDNs)
     fw_objs = parse_fortigate_objects(conf_file)
     
-    # 4. [Phase 1] Diagnose subnet overlaps/redundancies
-    check_redundant_subnets(fw_objs, whitelist_nets)
-    
-    # 5. [Phase 1] Evaluate objects for inactivity
+    # 4. [Phase 1] Evaluate objects for inactivity
     inactive_data = compare_and_find_inactive(fw_objs, active_nets, whitelist_nets)
     
-    # 6. [Phase 1] Output the initial evaluation and retain the set of unique names 
+    # 5. [Phase 1] Output the initial evaluation and retain the set of unique names 
     inactive_obj_names = export_inactive_to_txt(inactive_data)
     
     if inactive_obj_names:
-        # 7. [Phase 2] Parse the config again for Group and Policy usages
+        # 6. [Phase 2] Parse the config again for Group and Policy usages
         grps_to_modify, pol_usages, all_grp_members = parse_config_for_usage(conf_file, inactive_obj_names)
         
-        # 8. [Phase 2] Generate outputs for FMG UI handling
+        # 7. [Phase 2] Generate outputs for FMG UI handling
         generate_policy_report(pol_usages)
         generate_fmg_script(grps_to_modify, all_grp_members)
     
