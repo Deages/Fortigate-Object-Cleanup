@@ -7,13 +7,13 @@ Phase 1: Analysis & Identification
 - Parses a FortiOS configuration file for all address objects.
 - Compares those objects against a master list of active routing networks.
 - Bypasses objects based on scope (RFC 1918) and whitelist criteria.
-- Outputs unused objects to 'inactive_objects.txt'.
+- Outputs unused objects to './outputs/inactive_objects.txt'.
 
 Phase 2: FortiManager CLI Preparation
 - Scans the FortiOS configuration again to map VDOMs, Groups, and Policies.
 - Identifies if any of the inactive objects are actively referenced.
-- Generates FMG CLI syntax ('fmg_script_config.txt') to safely unbind objects from groups.
-- Generates a manual cleanup report ('policy_id_cleanup.txt') for objects stuck in policies.
+- Generates FMG CLI syntax ('./outputs/fmg_script_config.txt') to safely unbind objects from groups.
+- Generates a manual cleanup report ('./outputs/policy_id_cleanup.txt') for objects stuck in policies.
 """
 
 import os
@@ -35,10 +35,19 @@ except ImportError:
 # Global Configuration & Setup
 # ==========================================
 
-LOG_FILE = "script_log.txt"
-OUTPUT_INACTIVE = "inactive_objects.txt"
-OUTPUT_FMG_CONFIG = "fmg_script_config.txt"
-POLICY_REPORT = "policy_id_cleanup.txt"
+INPUT_DIR = "./inputs"
+OUTPUT_DIR = "./outputs"
+LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+
+# Create directories if they do not exist
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, "script_log.txt")
+OUTPUT_INACTIVE = os.path.join(OUTPUT_DIR, "inactive_objects.txt")
+OUTPUT_FMG_CONFIG = os.path.join(OUTPUT_DIR, "fmg_script_config.txt")
+POLICY_REPORT = os.path.join(OUTPUT_DIR, "policy_id_cleanup.txt")
 WHITELIST_FILE = "whitelist.txt"
 
 # Target ranges to evaluate for inactivity (RFC 1918 + Specific Public Range)
@@ -64,31 +73,36 @@ logging.basicConfig(
 # ==========================================
 
 def find_files():
-    """Locate the FortiGate config, active networks, and whitelist file."""
-    conf_files = glob.glob('*.conf') + [f for f in glob.glob('*.txt') if 'fw' in f.lower() or 'conf' in f.lower()]
-    raw_data_files = glob.glob('*.csv') + glob.glob('*.xlsx') + glob.glob('*.txt')
+    """Locate the FortiGate config, active networks, and whitelist file inside ./inputs."""
+    
+    conf_search = os.path.join(INPUT_DIR, '*.conf')
+    txt_search = os.path.join(INPUT_DIR, '*.txt')
+    csv_search = os.path.join(INPUT_DIR, '*.csv')
+    xlsx_search = os.path.join(INPUT_DIR, '*.xlsx')
+    
+    conf_files = glob.glob(conf_search) + [f for f in glob.glob(txt_search) if 'fw' in os.path.basename(f).lower() or 'conf' in os.path.basename(f).lower()]
+    raw_data_files = glob.glob(csv_search) + glob.glob(xlsx_search) + glob.glob(txt_search)
     
     data_files = []
     
-    # Aggressively filter out previous script outputs from being treated as data files
-    ignore_list = [OUTPUT_INACTIVE.lower(), OUTPUT_FMG_CONFIG.lower(), POLICY_REPORT.lower(), LOG_FILE.lower()]
+    # Aggressively filter out previous script outputs in case they are dropped in inputs
+    ignore_list = ["inactive_objects.txt", "fmg_script_config.txt", "policy_id_cleanup.txt", "script_log.txt"]
     
     for f in raw_data_files:
-        lower_f = f.lower()
-        if lower_f in ignore_list or 'inactive' in lower_f or 'script_log' in lower_f or 'fmg_' in lower_f:
+        base_f = os.path.basename(f).lower()
+        if base_f in ignore_list or 'inactive' in base_f or 'script_log' in base_f or 'fmg_' in base_f:
             continue
         data_files.append(f)
         
     for ignore_file in ignore_list:
-        # Need to check case-insensitively for the conf files too
-        conf_files = [c for c in conf_files if c.lower() != ignore_file]
+        conf_files = [c for c in conf_files if os.path.basename(c).lower() != ignore_file]
             
     for c in conf_files:
         if c in data_files:
             data_files.remove(c)
 
     if not conf_files:
-        logging.error("No FortiGate .conf (or valid .txt) config file found in the current directory.")
+        logging.error(f"No FortiGate .conf (or valid .txt) config file found in '{INPUT_DIR}'.")
         exit(1)
 
     selected_conf = conf_files[0]
@@ -96,7 +110,7 @@ def find_files():
     selected_whitelist = None
     
     for f in data_files.copy():
-        if f.lower() == WHITELIST_FILE:
+        if os.path.basename(f).lower() == WHITELIST_FILE:
             selected_whitelist = f
             data_files.remove(f)
             break
@@ -105,7 +119,7 @@ def find_files():
         selected_routing = data_files[0]
 
     if not selected_routing:
-        logging.error("No active networks .csv, .xlsx, or .txt file found.")
+        logging.error(f"No active networks .csv, .xlsx, or .txt file found in '{INPUT_DIR}'.")
         exit(1)
 
     logging.info(f"Selected FortiGate Config: {selected_conf}")
@@ -114,7 +128,7 @@ def find_files():
     if selected_whitelist:
         logging.info(f"Selected Whitelist File: {selected_whitelist}")
     else:
-        logging.warning(f"No {WHITELIST_FILE} found. Whitelist logic will be bypassed.")
+        logging.warning(f"No {WHITELIST_FILE} found in '{INPUT_DIR}'. Whitelist logic will be bypassed.")
     
     return selected_conf, selected_routing, selected_whitelist
 
